@@ -1,0 +1,421 @@
+---
+title: "SBND"
+author: "David Murillo Castellano"
+date: "2024-05-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Carga datos
+
+```{r echo=TRUE, include=TRUE, warning=FALSE}
+
+# Paquetes generales que pueden se de utilidad
+library(readr)
+library(readxl)
+#library(pillar)
+library(reshape2)
+#library(stringr)
+#library(directlabels)
+library(tidyverse)
+#library(magrittr)
+library(spatstat)
+library(sp)
+library(geodata)
+library(geoR)
+
+# Las librerías realmente utilizadas en este código
+library(sf)
+library(gstat)
+library(stars)
+library(ggplot2)
+library(gridExtra)
+library(plotly)
+library(ggpubr)
+library(plot3D)
+library(scatterplot3d)
+library(RandomFields)
+
+# Creamos una paleta de colores propia
+# Contour graphics (filled. contour function)
+require(grDevices); require(graphics);require(plot3D)
+# Defining a new color palette
+mis.colores <- colorRampPalette(c("white", "lightblue","yellow", "red"))
+
+
+# Ajuste necesario si se simulan modelos de covarianzas espacio temporales
+RFoptions(Ttriple=FALSE)
+
+# Se fila una semilla para que al ejecutar el código siempre se obtengan las 
+# las mismas simulaciones
+RFoptions(seed=0)
+
+# Esta orden libera memoria porque borra todos los objetos cargados en memoria
+#rm(list = ls())
+
+```
+
+```{r}
+datos<-read.table("datos_limpios.csv",header=T)
+datos$eventID<-as.factor(datos$eventID)
+#datos$eventID<-as.ordered(datos$eventID)
+```
+
+```{r}
+# Nos quedamos con un subconjunto de los datos que vamos a representar. 
+datos_rep<-datos[datos$eventID==80 | datos$eventID==121 | datos$eventID==163 | datos$eventID==173| datos$eventID==187 | datos$eventID==248,]
+datos_rep$eventID<-factor(datos_rep$eventID,ordered=F)
+# Representación espacial
+scatterplot3d(datos_rep$hitX, datos_rep$hitZ, datos_rep$hitY,
+              color = c("blue", "orange","slategrey","green","red","magenta")[datos_rep$eventID], pch = 19,
+              grid = TRUE, xlab = "hitX", ylab = "hitZ", xlim=c(-200,200),ylim=c(0,500),
+              zlab = "hitY", angle = 65, cex.axis = 0.5)
+legend("topright",       bty = "n", cex = 0.5,
+       title = "eventID",
+       c("80", "121","163","173","187","248"), fill = c("blue", "orange","slategrey","green","red","magenta"))
+```
+
+```{r}
+# Función para detectar warnings
+capture_warning <- function(expr) {
+  warning_occurred <- FALSE
+  result <- tryCatch(
+    expr,
+    warning = function(w) {
+      warning_occurred <<- TRUE
+      return(NULL) # Return NULL to indicate a warning occurred
+    }
+  )
+  list(result = result, warning = warning_occurred)
+}
+
+# Creamos un data frame donde guardar los resultados obtenidos para cada evento
+resultados<-data.frame(evento=numeric(),d.sem=numeric(),d.est=numeric())
+
+# De los 300 eventos escogidos, vemos cuáles podemos ajustar
+eventos<-as.numeric(levels(datos$eventID))
+l<-0 # Contador de eventos para los que se ha logrado convergencia
+for (k in 1:300)
+{
+  datos_evento<-datos[datos$eventID==eventos[k],] # Nos quedamos con el evento que toque
+  encontrado<-F # Variable de control para saltar la ejecución de aquellos eventos que ya se hayan logrado modelar
+  # Rejilla para hacer la simulación
+  obs_data<-datos_evento[,c(6,7,10)]
+  coordinates(obs_data)<-~hitX+hitY
+  v0<-as.numeric(datos_evento[which.min(datos_evento$hitZ),c(6,7)])
+  xrange <- seq(v0[1]-5, v0[1]+5,by=0.1)
+  yrange <- seq(v0[2]-5, v0[2]+5,by=0.1)
+  grid <- expand.grid(x = xrange, y = yrange)
+  coordinates(grid)<-~x+y
+  
+  # Obtenemos el variograma empírico
+  vario<-variogram(hitInteg ~ 1, data = obs_data)
+  max.var<-max(vario$np) # Máximo del variograma experimental
+  meseta.opt<-c(0.2*max.var,0.4*max.var,0.5*max.var,0.7*max.var,0.8*max.var) # Valores posibles para la meseta
+  
+  # Tratamos de ajustar a un modelo esférico con distintos parámetros
+  for (rango in c(1,5))
+  {
+    for (meseta in meseta.opt)
+    {
+      if (encontrado==F)
+      {
+        res<-capture_warning(fit.variogram(vario, model = vgm(psill = meseta, model = "Sph", range = rango)))
+        if (!res$warning) # Si no devuelve error, evalúamos y saltamos al siguiente
+        {
+          l<-l+1
+          encontrado<-T
+          vgm_model<-res$result
+          # Hacemos kriging ordinario en la malla
+          res <- capture_warning(krige(hitInteg ~ 1, locations = obs_data, newdata = grid, model = vgm_model))
+          if (!res$warning)
+          {
+          krig_result<-res$result
+          # Graficar el mapa de varianzas del kriging ordinario con la semilla y el true vertex
+          v0<-as.numeric(datos_evento[which.min(datos_evento$hitZ),c(6,7)]) #Semilla (rojo)
+          vT<-as.numeric(datos_evento[1,c(3,4)]) #Real (azul)
+          v<-data.frame(hitX=c(v0[1],vT[1]),hitY=c(v0[2],vT[2]))
+          coordinates(v)<-~hitX+hitY
+          p<-data.frame(index=c(0),d=c(0))
+          n<-length(krig_result$var1.var)
+          
+          j<-0
+          for (i in 1:n)
+          {
+            d2<-sum((krig_result@coords[i,]-v0)^2)
+            if (d2<=25)
+            {
+              j<-j+1
+              p[j,1]<-i
+              p[j,2]<-sqrt(d2)
+            }
+          }
+          
+          # Ordenamos el data frame en la distancia
+          p<-p[order(p$d),]
+          
+          #Iteramos hasta que encontramos un punto por debajo de una varianza máx
+          min.var<-0.7*max(krig_result$var1.var)
+          max.var<-0.85*max(krig_result$var1.var)
+          n<-nrow(p)
+          
+          for (i in 1:n)
+          {
+            var0<-krig_result$var1.var[p[i,1]]
+            if (var0>min.var && var0<max.var)
+            {
+              i<-as.numeric(i)
+              vEst<-krig_result@coords[p[i,1],] # Vértice estimado (magenta)
+              break
+            }
+          }
+          
+          # Guardamos los resultados en el data frame
+          resultados<-rbind(resultados,data.frame(evento=c(eventos[k]),d.sem=c(sqrt(sum((v0-vT)^2))),d.est=c(sqrt(sum((vEst-vT)^2)))))
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+```{r}
+# Representación de las distancias del vértice a la semilla y a la estimación
+boxplot(resultados$d.sem,resultados$d.est,names=c("Semilla","Estimación"),ylab="Distancia (cm)",ylim=c(0,5))
+segments(0.605,mean(resultados$d.sem),1.4,col="red")
+segments(1.605,mean(resultados$d.est),2.4,col="red")
+#legend("topleft",col="red",lty=1,legend=c("Media"), bty = "n",cex=0.8)
+```
+
+```{r}
+# Buscamos gráficas de los mejores resultados obtenidos. Los eventos para los que mejor ha funcionado el método son: 74, 53, 23, 56, 45, 61, 106.
+
+# Suceso 74
+datos_evento<-datos[datos$eventID==resultados$evento[74],]
+obs_data<-datos_evento[,c(6,7,10)]
+coordinates(obs_data)<-~hitX+hitY
+v0<-as.numeric(datos_evento[which.min(datos_evento$hitZ),c(6,7)])
+xrange <- seq(v0[1]-5, v0[1]+5,by=0.1)
+yrange <- seq(v0[2]-5, v0[2]+5,by=0.1)
+grid <- expand.grid(x = xrange, y = yrange)
+coordinates(grid)<-~x+y
+
+# Obtenemos el variograma empírico
+vario<-variogram(hitInteg ~ 1, data = obs_data)
+max.var<-max(vario$np) # Máximo del variograma experimental
+vgm_model<-fit.variogram(vario, model = vgm(psill = 0.6*max.var, model = "Sph", range = 5))
+krig_result<-krige(hitInteg ~ 1, locations = obs_data, newdata = grid, model = vgm_model)
+
+# Estimación del vértice
+
+p<-data.frame(index=c(0),d=c(0))
+n<-length(krig_result$var1.var)
+
+j<-0
+for (i in 1:n)
+{
+  d2<-sum((krig_result@coords[i,]-v0)^2)
+  if (d2<=25)
+  {
+    j<-j+1
+    p[j,1]<-i
+    p[j,2]<-sqrt(d2)
+  }
+}
+
+# Ordenamos el data frame en la distancia
+p<-p[order(p$d),]
+
+#Iteramos hasta que encontramos un punto por debajo de una varianza máx
+min.var<-0.7*max(krig_result$var1.var)
+max.var<-0.85*max(krig_result$var1.var)
+n<-nrow(p)
+
+for (i in 1:n)
+{
+  var0<-krig_result$var1.var[p[i,1]]
+  if (var0>min.var && var0<max.var)
+  {
+    i<-as.numeric(i)
+    vEst<-krig_result@coords[p[i,1],] # Vértice estimado
+    break
+  }
+}
+
+# Representación gráfica
+v0<-as.numeric(datos_evento[which.min(datos_evento$hitZ),c(6,7)]) #Semilla
+vT<-as.numeric(datos_evento[1,c(3,4)]) #Real
+v<-data.frame(hitX=c(v0[1],vT[1],vEst[1]),hitY=c(v0[2],vT[2],vEst[2]))
+coordinates(v)<-~hitX+hitY
+spplot(krig_result, "var1.var", main = "eventID = 248",
+       col.regions = terrain.colors(100), colorkey = TRUE
+       ,sp.layout = list("sp.points", v,cex=0.4, pch = 19, col = c("black","blue","turquoise1"))
+       )
+
+# Proyección traza en XY
+datos_evento<-subset(datos,datos$eventID == "248")
+datos_evento<-data.frame(datos_evento)
+datos_evento$eventID<-as.factor(datos_evento$eventID)
+
+obs_data<-datos_evento[,c(6,7,10)]
+coordinates(obs_data)<-~hitX+hitY
+
+# Rejilla para hacer la simulación
+v0<-as.numeric(datos_evento[which.min(datos_evento$hitZ),c(6,7)])
+xrange <- seq(min(datos_evento$hitX)-5, max(datos_evento$hitX)+5,by=0.1)
+yrange <- seq(min(datos_evento$hitY)-5, max(datos_evento$hitY)+5,by=0.1)
+grid <- expand.grid(x = xrange, y = yrange)
+coordinates(grid)<-~x+y
+
+# Dibujamos la malla con las localizaciones fijas de la traza del evento 5
+#plot(grid, pch=20,cex=2, asp = 1,col="brown",main="Traza del eventID = 248")
+#points(obs_data, pch = 3, cex = 0.2,col = "yellow")
+```
+
+```{r}
+# Suceso 53
+datos_evento<-datos[datos$eventID==resultados$evento[53],]
+obs_data<-datos_evento[,c(6,7,10)]
+coordinates(obs_data)<-~hitX+hitY
+v0<-as.numeric(datos_evento[which.min(datos_evento$hitZ),c(6,7)])
+xrange <- seq(v0[1]-5, v0[1]+5,by=0.1)
+yrange <- seq(v0[2]-5, v0[2]+5,by=0.1)
+grid <- expand.grid(x = xrange, y = yrange)
+coordinates(grid)<-~x+y
+
+# Obtenemos el variograma empírico
+vario<-variogram(hitInteg ~ 1, data = obs_data)
+max.var<-max(vario$np) # Máximo del variograma experimental
+vgm_model<-fit.variogram(vario, model = vgm(psill = 0.6*max.var, model = "Sph", range = 5))
+krig_result<-krige(hitInteg ~ 1, locations = obs_data, newdata = grid, model = vgm_model)
+
+# Estimación del vértice
+
+p<-data.frame(index=c(0),d=c(0))
+n<-length(krig_result$var1.var)
+
+j<-0
+for (i in 1:n)
+{
+  d2<-sum((krig_result@coords[i,]-v0)^2)
+  if (d2<=25)
+  {
+    j<-j+1
+    p[j,1]<-i
+    p[j,2]<-sqrt(d2)
+  }
+}
+
+# Ordenamos el data frame en la distancia
+p<-p[order(p$d),]
+
+#Iteramos hasta que encontramos un punto por debajo de una varianza máx
+min.var<-0.7*max(krig_result$var1.var)
+max.var<-0.85*max(krig_result$var1.var)
+n<-nrow(p)
+
+for (i in 1:n)
+{
+  var0<-krig_result$var1.var[p[i,1]]
+  if (var0>min.var && var0<max.var)
+  {
+    i<-as.numeric(i)
+    vEst<-krig_result@coords[p[i,1],] # Vértice estimado
+    break
+  }
+}
+
+# Representación gráfica
+v0<-as.numeric(datos_evento[which.min(datos_evento$hitZ),c(6,7)]) #Semilla
+vT<-as.numeric(datos_evento[1,c(3,4)]) #Real
+v<-data.frame(hitX=c(v0[1],vT[1],vEst[1]),hitY=c(v0[2],vT[2],vEst[2]))
+coordinates(v)<-~hitX+hitY
+spplot(krig_result, "var1.var", main = "Mapa de varianzas",
+       col.regions = terrain.colors(100), colorkey = TRUE
+       ,sp.layout = list("sp.points", v,cex=0.4, pch = 19, col = c("black","blue","turquoise1"))
+       )
+```
+
+```{r}
+# Suceso 23
+datos_evento<-datos[datos$eventID==resultados$evento[23],]
+obs_data<-datos_evento[,c(6,7,10)]
+coordinates(obs_data)<-~hitX+hitY
+v0<-as.numeric(datos_evento[which.min(datos_evento$hitZ),c(6,7)])
+xrange <- seq(v0[1]-5, v0[1]+5,by=0.1)
+yrange <- seq(v0[2]-5, v0[2]+5,by=0.1)
+grid <- expand.grid(x = xrange, y = yrange)
+coordinates(grid)<-~x+y
+
+# Obtenemos el variograma empírico
+vario<-variogram(hitInteg ~ 1, data = obs_data)
+max.var<-max(vario$np) # Máximo del variograma experimental
+vgm_model<-fit.variogram(vario, model = vgm(psill = 0.6*max.var, model = "Sph", range = 5))
+krig_result<-krige(hitInteg ~ 1, locations = obs_data, newdata = grid, model = vgm_model)
+
+# Estimación del vértice
+
+p<-data.frame(index=c(0),d=c(0))
+n<-length(krig_result$var1.var)
+
+j<-0
+for (i in 1:n)
+{
+  d2<-sum((krig_result@coords[i,]-v0)^2)
+  if (d2<=25)
+  {
+    j<-j+1
+    p[j,1]<-i
+    p[j,2]<-sqrt(d2)
+  }
+}
+
+# Ordenamos el data frame en la distancia
+p<-p[order(p$d),]
+
+#Iteramos hasta que encontramos un punto por debajo de una varianza máx
+min.var<-0.7*max(krig_result$var1.var)
+max.var<-0.85*max(krig_result$var1.var)
+n<-nrow(p)
+
+for (i in 1:n)
+{
+  var0<-krig_result$var1.var[p[i,1]]
+  if (var0>min.var && var0<max.var)
+  {
+    i<-as.numeric(i)
+    vEst<-krig_result@coords[p[i,1],] # Vértice estimado
+    break
+  }
+}
+
+# Representación gráfica
+v0<-as.numeric(datos_evento[which.min(datos_evento$hitZ),c(6,7)]) #Semilla
+vT<-as.numeric(datos_evento[1,c(3,4)]) #Real
+v<-data.frame(hitX=c(v0[1],vT[1],vEst[1]),hitY=c(v0[2],vT[2],vEst[2]))
+coordinates(v)<-~hitX+hitY
+spplot(krig_result, "var1.var", main = "eventID = 80",
+       col.regions = terrain.colors(100), colorkey = TRUE
+       ,sp.layout = list("sp.points", v,cex=0.4, pch = 19, col = c("black","blue","turquoise1"))
+       ) # Semilla, real, estimación
+
+# Proyección traza en XY
+datos_evento<-subset(datos,datos$eventID == "80")
+datos_evento<-data.frame(datos_evento)
+datos_evento$eventID<-as.factor(datos_evento$eventID)
+
+obs_data<-datos_evento[,c(6,7,10)]
+coordinates(obs_data)<-~hitX+hitY
+
+# Rejilla para hacer la simulación
+v0<-as.numeric(datos_evento[which.min(datos_evento$hitZ),c(6,7)])
+xrange <- seq(min(datos_evento$hitX)-5, max(datos_evento$hitX)+5,by=0.1)
+yrange <- seq(min(datos_evento$hitY)-5, max(datos_evento$hitY)+5,by=0.1)
+grid <- expand.grid(x = xrange, y = yrange)
+coordinates(grid)<-~x+y
+
+```
