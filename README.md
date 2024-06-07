@@ -1,1 +1,1 @@
-# TFG
+Código fuente en lenguaje R ("SBND.Rmd") empleado para tratar de afrontar el problema de determinación del vértice en el detector SBND. En el archivo "datos_limpios.csv" puede encontrarse el conjunto de datos utilizado en el análisis.
